@@ -7,8 +7,8 @@ local oklab = require("../../utils/oklab")
 local read = require("../../utils/read")
 local types = require("../../reactive/types")
 
-type AnimatableDataTypeEnum = "color" | "vector" | "udim" | "udim2"
-type AnimatableDataType = Color3 | vector | UDim | UDim2
+type AnimatableDataTypeEnum = "color" | "vector" | "udim" | "udim2" | "number"
+type AnimatableDataType = Color3 | vector | UDim | UDim2 | number
 
 -- In order to support springing multiple data types, we need to abstract values into an array.
 -- It sucks, but it is necessary to support things like UDim2 and Color3.
@@ -28,63 +28,58 @@ type SpringState = {
 	unpacked_value: AnimatableDataType,
 }
 
-local active_springs: { [SpringState]: graph.SourceNode<AnimatableDataType> } =
-	{}
+type SpringSettings<T> = ({
+	position: T?,
+	velocity: T?,
+	impulse: T?,
+}) -> ()
 
-local function pack_type(
-	value: AnimatableDataType
-): (AnimatableDataTypeEnum, { number })
+local active_springs: { [SpringState]: graph.SourceNode<AnimatableDataType> } = {}
+
+local function pack_type(value: AnimatableDataType): (AnimatableDataTypeEnum, { number })
 	if typeof(value) == "Color3" then
 		-- oklab conversion
-		local intermediate_vector =
-			oklab.from_srgb(vector.create(value.R, value.G, value.B))
+		local intermediate_vector = oklab.from_srgb(vector.create(value.R, value.G, value.B))
 
-		return "color",
-			{
-				intermediate_vector.x,
-				intermediate_vector.y,
-				intermediate_vector.z,
-			}
+		return "color", {
+			intermediate_vector.x,
+			intermediate_vector.y,
+			intermediate_vector.z,
+		}
 	elseif typeof(value) == "UDim2" then
-		return "udim2",
-			{ value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset }
+		return "udim2", { value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset }
 	elseif typeof(value) == "UDim" then
 		return "udim", { value.Scale, value.Offset }
 	elseif type(value) == "vector" then
 		return "vector", { value.x, value.y, value.z }
+	elseif type(value) == "number" then
+		return "number", { value }
 	end
 
 	error("unreachable")
 end
 
-local function unpack_type(
-	type_string: AnimatableDataTypeEnum,
-	array: { number }
-): AnimatableDataType
+local function unpack_type(type_string: AnimatableDataTypeEnum, array: { number }): AnimatableDataType
 	if type_string == "color" then
 		-- oklab conversion
-		local intermediate_vector =
-			oklab.to_srgb(vector.create(array[1], array[2], array[3]))
+		local intermediate_vector = oklab.to_srgb(vector.create(array[1], array[2], array[3]))
 
-		return Color3.new(
-			intermediate_vector.x,
-			intermediate_vector.y,
-			intermediate_vector.z
-		)
+		return Color3.new(intermediate_vector.x, intermediate_vector.y, intermediate_vector.z)
 	elseif type_string == "vector" then
 		return vector.create(array[1], array[2], array[3])
 	elseif type_string == "udim" then
 		return UDim.new(array[1], array[2])
 	elseif type_string == "udim2" then
 		return UDim2.new(array[1], array[2], array[3], array[4])
+	elseif type_string == "number" then
+		return array[1]
 	end
 
 	return error("unreachable")
 end
 
 local function step_spring<T>(state: SpringState, delta_time: number)
-	local pos_pos, pos_vel, vel_pos, vel_vel =
-		coefficients(delta_time, state.damping, state.speed)
+	local pos_pos, pos_vel, vel_pos, vel_vel = coefficients(delta_time, state.damping, state.speed)
 
 	-- iterate and solve the spring for each value in our SpringValue
 	for i = 1, state.elements do
@@ -113,11 +108,7 @@ end
 
 local spring_file = {}
 
-function spring_file.create<T>(
-	input: types.UsedAs<T>,
-	speed: number,
-	damping: number
-): T
+function spring_file.create<T>(input: types.UsedAs<T>, speed: number, damping: number): (() -> T, SpringSettings<T>)
 	-- initialize spring state early so we can reference it in the effect for the output node
 	local spring_state: SpringState
 
@@ -125,10 +116,7 @@ function spring_file.create<T>(
 		local input_as_value = read(input)
 
 		local datatype, array = pack_type(input_as_value)
-		assert(
-			datatype == spring_state.datatype,
-			"Can't switch the data types of a spring"
-		)
+		assert(datatype == spring_state.datatype, "Can't switch the data types of a spring")
 
 		spring_state.target = array
 
@@ -160,19 +148,41 @@ function spring_file.create<T>(
 	active_springs[spring_state] = output :: any
 
 	-- set up the dependency
-	local input_node = graph.create_reactive_node(
-		graph.assert_stable_parent(),
-		on_update,
-		"deferred",
-		read(input)
-	)
+	local input_node = graph.create_reactive_node(graph.assert_stable_parent(), on_update, "deferred", read(input))
 
 	graph.evaluate_node(input_node)
+
+	local config: SpringSettings<T> = function(p)
+		local x = p.position
+		local v = p.velocity
+		local dv = p.impulse
+
+		if x then
+			local _, pos = pack_type(x :: any)
+			spring_state.position = pos
+		end
+
+		if v then
+			local _, vel = pack_type(v :: any)
+			for i = 1, #starting_value do
+				spring_state.velocity[i] = vel[i]
+			end
+		end
+
+		if dv then
+			local _, delta_vel = pack_type(dv :: any)
+			for i = 1, #starting_value do
+				spring_state.velocity[i] += delta_vel[i]
+			end
+		end
+
+		active_springs[spring_state] = output :: any
+	end
 
 	return function()
 		graph.push_dependency(output)
 		return output.cached_value
-	end
+	end, config
 end
 
 function spring_file.step(delta_time: number)
